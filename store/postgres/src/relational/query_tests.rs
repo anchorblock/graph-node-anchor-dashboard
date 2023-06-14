@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use diesel::{debug_query, pg::Pg};
 use graph::{
     components::store::EntityType,
-    prelude::{r, serde_json as json, DeploymentHash, EntityFilter, Schema},
+    prelude::{r, serde_json as json, DeploymentHash, EntityFilter},
+    schema::InputSchema,
 };
 
 use crate::{
@@ -30,17 +31,18 @@ fn gql_value_from_bytes() {
 
 fn test_layout(gql: &str) -> Layout {
     let subgraph = DeploymentHash::new("subgraph").unwrap();
-    let schema = Schema::parse(gql, subgraph.clone()).expect("Test schema invalid");
+    let schema = InputSchema::parse(gql, subgraph.clone()).expect("Test schema invalid");
     let namespace = Namespace::new("sgd0815".to_owned()).unwrap();
     let site = Arc::new(make_dummy_site(subgraph, namespace, "anet".to_string()));
-    let catalog = Catalog::for_tests(site.clone()).expect("Can not create catalog");
+    let catalog =
+        Catalog::for_tests(site.clone(), BTreeSet::new()).expect("Can not create catalog");
     Layout::new(site, &schema, catalog).expect("Failed to construct Layout")
 }
 
 #[track_caller]
 fn filter_contains(filter: EntityFilter, sql: &str) {
     const SCHEMA: &str = "
-    type Thing @entity { 
+    type Thing @entity {
         id: Bytes!,
         address: Bytes!,
         name: String

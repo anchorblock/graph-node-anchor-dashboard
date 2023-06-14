@@ -10,6 +10,7 @@ use diesel::prelude::{
 use diesel_derives::Associations;
 use git_testament::{git_testament, git_testament_macros};
 use graph::blockchain::BlockHash;
+use graph::components::store::EntityType;
 use graph::data::subgraph::schema::{SubgraphError, SubgraphManifestEntity};
 use graph::prelude::{
     bigdecimal::ToPrimitive, BigDecimal, BlockPtr, DeploymentHash, StoreError,
@@ -17,6 +18,7 @@ use graph::prelude::{
 };
 use graph::{constraint_violation, data::subgraph::status, prelude::web3::types::H256};
 use itertools::Itertools;
+use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::{ops::Bound, sync::Arc};
 
@@ -181,6 +183,7 @@ pub(crate) fn info_from_details(
     fatal: Option<ErrorDetail>,
     non_fatal: Vec<ErrorDetail>,
     sites: &[Arc<Site>],
+    subgraph_history_blocks: i32,
 ) -> Result<status::Info, StoreError> {
     let DeploymentDetail {
         id,
@@ -244,6 +247,7 @@ pub(crate) fn info_from_details(
         chains: vec![chain],
         entity_count,
         node: None,
+        history_blocks: subgraph_history_blocks,
     })
 }
 
@@ -271,6 +275,7 @@ pub(crate) fn deployment_statuses(
 ) -> Result<Vec<status::Info>, StoreError> {
     use subgraph_deployment as d;
     use subgraph_error as e;
+    use subgraph_manifest as sm;
 
     // First, we fetch all deployment information along with any fatal errors.
     // Subsequently, we fetch non-fatal errors and we group them by deployment
@@ -311,11 +316,27 @@ pub(crate) fn deployment_statuses(
         .into_group_map()
     };
 
+    let mut history_blocks_map: HashMap<_, _> = {
+        if sites.is_empty() {
+            sm::table
+                .select((sm::id, sm::history_blocks))
+                .load::<(DeploymentId, i32)>(conn)?
+        } else {
+            sm::table
+                .filter(sm::id.eq_any(sites.iter().map(|site| site.id)))
+                .select((sm::id, sm::history_blocks))
+                .load::<(DeploymentId, i32)>(conn)?
+        }
+        .into_iter()
+        .collect()
+    };
+
     details_with_fatal_error
         .into_iter()
         .map(|(detail, fatal)| {
-            let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or(vec![]);
-            info_from_details(detail, fatal, non_fatal, sites)
+            let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or_default();
+            let subgraph_history_blocks = history_blocks_map.remove(&detail.id).unwrap_or_default();
+            info_from_details(detail, fatal, non_fatal, sites, subgraph_history_blocks)
         })
         .collect()
 }
@@ -338,6 +359,9 @@ struct StoredSubgraphManifest {
     start_block_number: Option<i32>,
     start_block_hash: Option<Bytes>,
     raw_yaml: Option<String>,
+    entities_with_causality_region: Vec<EntityType>,
+    on_sync: Option<String>,
+    history_blocks: i32,
 }
 
 impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
@@ -349,6 +373,8 @@ impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
             features: value.features,
             schema: value.schema,
             raw_yaml: value.raw_yaml,
+            entities_with_causality_region: value.entities_with_causality_region,
+            history_blocks: value.history_blocks,
         }
     }
 }

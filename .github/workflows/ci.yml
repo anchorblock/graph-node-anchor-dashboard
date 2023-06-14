@@ -37,6 +37,9 @@ jobs:
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
     steps:
+      - name: Tune GitHub hosted runner to reduce flakiness
+        # https://github.com/smorimoto/tune-github-hosted-runner-network/blob/main/action.yml
+        run: sudo ethtool -K eth0 tx off rx off
       - name: Checkout sources
         uses: actions/checkout@v2
       - uses: Swatinem/rust-cache@v2
@@ -75,6 +78,9 @@ jobs:
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
     steps:
+      - name: Tune GitHub hosted runner to reduce flakiness
+        # https://github.com/smorimoto/tune-github-hosted-runner-network/blob/main/action.yml
+        run: sudo ethtool -K eth0 tx off rx off
       - name: Checkout sources
         uses: actions/checkout@v2
       - uses: Swatinem/rust-cache@v2
@@ -86,7 +92,7 @@ jobs:
         id: runner-tests-1
         uses: actions-rs/cargo@v1
         env:
-          TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
+          TESTS_GANACHE_HARD_WAIT_SECONDS: "60"
         with:
           command: test
           args: --verbose --package graph-tests -- --skip parallel_integration_tests
@@ -98,14 +104,17 @@ jobs:
     env:
       RUSTFLAGS: "-C link-arg=-fuse-ld=lld -D warnings"
     steps:
+      - name: Tune GitHub hosted runner to reduce flakiness
+        # https://github.com/smorimoto/tune-github-hosted-runner-network/blob/main/action.yml
+        run: sudo ethtool -K eth0 tx off rx off
       - name: Checkout sources
         uses: actions/checkout@v2
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Node 14
+      - name: Install Node 16
         uses: actions/setup-node@v3
         with:
-          node-version: "14"
+          node-version: "16"
           cache: yarn
           cache-dependency-path: "tests/integration-tests/yarn.lock"
 
@@ -126,6 +135,8 @@ jobs:
         env:
           N_CONCURRENT_TESTS: "4"
           TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
+          # Reduce how long a batch will stick around to avoid timeouts
+          GRAPH_STORE_WRITE_BATCH_DURATION: 30
         with:
           command: test
           args: --verbose --package graph-tests parallel_integration_tests -- --nocapture
@@ -137,6 +148,8 @@ jobs:
         env:
           N_CONCURRENT_TESTS: "4"
           TESTS_GANACHE_HARD_WAIT_SECONDS: "30"
+          # Reduce how long a batch will stick around to avoid timeouts
+          GRAPH_STORE_WRITE_BATCH_DURATION: 30
         with:
           command: test
           args: --verbose --package graph-tests parallel_integration_tests -- --nocapture
@@ -157,7 +170,7 @@ jobs:
           args: --all -- --check
 
   clippy:
-    name: Report Clippy warnings
+    name: Clippy linting
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -165,15 +178,12 @@ jobs:
       # Unlike rustfmt, Clippy actually compiles stuff so it benefits from
       # caching.
       - uses: Swatinem/rust-cache@v2
-
+      - name: Install deps
+        run: sudo apt-get install -y protobuf-compiler
       - name: Run Clippy
         uses: actions-rs/cargo@v1
-        # We do *not* block builds if Clippy complains. It's just here to let us
-        # keep an eye out on the warnings it produces.
-        continue-on-error: true
         with:
-          command: clippy
-          args: --no-deps
+          command: check-clippy
 
   release-check:
     name: Build in release mode

@@ -17,7 +17,7 @@ pub fn ipfs_service(
     client: IpfsClient,
     max_file_size: u64,
     timeout: Duration,
-    concurrency_and_rate_limit: u16,
+    rate_limit: u16,
 ) -> IpfsService {
     let ipfs = IpfsServiceInner {
         client,
@@ -26,13 +26,13 @@ pub fn ipfs_service(
     };
 
     let svc = ServiceBuilder::new()
-        .rate_limit(concurrency_and_rate_limit.into(), Duration::from_secs(1))
-        .concurrency_limit(concurrency_and_rate_limit as usize)
+        .rate_limit(rate_limit.into(), Duration::from_secs(1))
         .service_fn(move |req| ipfs.cheap_clone().call_inner(req))
         .boxed();
 
-    // The `Buffer` makes it so the rate and concurrency limit are shared among clones.
-    Buffer::new(svc, 1)
+    // The `Buffer` makes it so the rate limit is shared among clones.
+    // Make it unbounded to avoid any risk of starvation.
+    Buffer::new(svc, u32::MAX as usize)
 }
 
 #[derive(Clone)]
@@ -136,7 +136,7 @@ mod test {
 
         let cl: ipfs::IpfsClient = ipfs::IpfsClient::default();
 
-        let rsp = cl.add_path(&path).await.unwrap();
+        let rsp = cl.add_path(path).await.unwrap();
 
         let ipfs_folder = rsp.iter().find(|rsp| rsp.name == "ipfs_folder").unwrap();
 

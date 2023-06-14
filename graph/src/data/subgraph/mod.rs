@@ -10,15 +10,19 @@ pub mod status;
 
 pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, Context, Error};
 use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
+use itertools::Itertools;
 use semver::Version;
 use serde::{de, ser};
 use serde_yaml;
-use slog::{info, Logger};
+use slog::Logger;
 use stable_hash::{FieldAddress, StableHash};
 use stable_hash_legacy::SequenceNumber;
-use std::{collections::BTreeSet, marker::PhantomData};
+use std::{
+    collections::{BTreeSet, HashMap, HashSet},
+    marker::PhantomData,
+};
 use thiserror::Error;
 use wasmparser;
 use web3::types::Address;
@@ -28,13 +32,10 @@ use crate::{
     blockchain::{BlockPtr, Blockchain, DataSource as _},
     components::{
         link_resolver::LinkResolver,
-        store::{DeploymentLocator, StoreError, SubgraphStore},
+        store::{StoreError, SubgraphStore},
     },
     data::{
-        graphql::TryFromValue,
-        query::QueryExecutionError,
-        schema::{Schema, SchemaImportError, SchemaValidationError},
-        store::Entity,
+        graphql::TryFromValue, query::QueryExecutionError,
         subgraph::features::validate_subgraph_features,
     },
     data_source::{
@@ -42,7 +43,8 @@ use crate::{
         UnresolvedDataSourceTemplate,
     },
     ensure,
-    prelude::{r, CheapClone, ENV_VARS},
+    prelude::{r, CheapClone, Value, ENV_VARS},
+    schema::{InputSchema, SchemaValidationError},
 };
 
 use crate::prelude::{impl_slog_value, BlockNumber, Deserialize, Serialize};
@@ -51,6 +53,8 @@ use std::fmt;
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
+
+use super::value::Word;
 
 /// Deserialize an Address (with or without '0x' prefix).
 fn deserialize_address<'de, D>(deserializer: D) -> Result<Option<Address>, D::Error>
@@ -218,6 +222,12 @@ impl SubgraphName {
         Ok(SubgraphName(s))
     }
 
+    /// Tests are allowed to create arbitrary subgraph names
+    #[cfg(debug_assertions)]
+    pub fn new_unchecked(s: impl Into<String>) -> Self {
+        SubgraphName(s.into())
+    }
+
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
@@ -304,8 +314,6 @@ pub enum SubgraphAssignmentProviderError {
     /// Occurs when attempting to remove a subgraph that's not hosted.
     #[error("Subgraph with ID {0} already running")]
     AlreadyRunning(DeploymentHash),
-    #[error("Subgraph with ID {0} is not running")]
-    NotRunning(DeploymentLocator),
     #[error("Subgraph provider error: {0}")]
     Unknown(#[from] anyhow::Error),
 }
@@ -314,12 +322,6 @@ impl From<::diesel::result::Error> for SubgraphAssignmentProviderError {
     fn from(e: ::diesel::result::Error) -> Self {
         SubgraphAssignmentProviderError::Unknown(e.into())
     }
-}
-
-#[derive(Error, Debug)]
-pub enum SubgraphManifestValidationWarning {
-    #[error("schema validation produced warnings: {0:?}")]
-    SchemaValidationWarning(SchemaImportError),
 }
 
 #[derive(Error, Debug)]
@@ -334,8 +336,6 @@ pub enum SubgraphManifestValidationError {
     EthereumNetworkRequired,
     #[error("the specified block must exist on the Ethereum network")]
     BlockNotFound(String),
-    #[error("imported schema(s) are invalid: {0:?}")]
-    SchemaImportError(Vec<SchemaImportError>),
     #[error("schema validation failed: {0:?}")]
     SchemaValidationError(Vec<SchemaValidationError>),
     #[error("the graft base is invalid: {0}")]
@@ -360,8 +360,27 @@ pub enum SubgraphManifestResolveError {
     ResolveError(#[from] anyhow::Error),
 }
 
-/// Data source contexts are conveniently represented as entities.
-pub type DataSourceContext = Entity;
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DataSourceContext(HashMap<Word, Value>);
+
+impl DataSourceContext {
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    // This collects the entries into an ordered vector so that it can be iterated deterministically.
+    pub fn sorted(self) -> Vec<(Word, Value)> {
+        let mut v: Vec<_> = self.0.into_iter().collect();
+        v.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+        v
+    }
+}
+
+impl From<HashMap<Word, Value>> for DataSourceContext {
+    fn from(map: HashMap<Word, Value>) -> Self {
+        Self(map)
+    }
+}
 
 /// IPLD link.
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
@@ -389,11 +408,12 @@ impl UnresolvedSchema {
         id: DeploymentHash,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
-    ) -> Result<Schema, anyhow::Error> {
-        info!(logger, "Resolve schema"; "link" => &self.file.link);
-
-        let schema_bytes = resolver.cat(logger, &self.file).await?;
-        Schema::parse(&String::from_utf8(schema_bytes)?, id)
+    ) -> Result<InputSchema, anyhow::Error> {
+        let schema_bytes = resolver
+            .cat(logger, &self.file)
+            .await
+            .with_context(|| format!("failed to resolve schema {}", &self.file.link))?;
+        InputSchema::parse(&String::from_utf8(schema_bytes)?, id)
     }
 }
 
@@ -478,6 +498,15 @@ impl Graft {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct DeploymentFeatures {
+    pub id: String,
+    pub spec_version: String,
+    pub api_version: Option<String>,
+    pub features: Vec<String>,
+    pub data_source_kinds: Vec<String>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BaseSubgraphManifest<C, S, D, T> {
@@ -506,7 +535,7 @@ pub type UnresolvedSubgraphManifest<C> = BaseSubgraphManifest<
 
 /// SubgraphManifest validated with IPFS links resolved
 pub type SubgraphManifest<C> =
-    BaseSubgraphManifest<C, Schema, DataSource<C>, DataSourceTemplate<C>>;
+    BaseSubgraphManifest<C, InputSchema, DataSource<C>, DataSourceTemplate<C>>;
 
 /// Unvalidated SubgraphManifest
 pub struct UnvalidatedSubgraphManifest<C: Blockchain>(SubgraphManifest<C>);
@@ -535,8 +564,6 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
         store: Arc<S>,
         validate_graft_base: bool,
     ) -> Result<SubgraphManifest<C>, Vec<SubgraphManifestValidationError>> {
-        let (schemas, _) = self.0.schema.resolve_schema_references(store.clone());
-
         let mut errors: Vec<SubgraphManifestValidationError> = vec![];
 
         // Validate that the manifest has at least one data source
@@ -571,7 +598,7 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
 
         self.0
             .schema
-            .validate(&schemas)
+            .validate()
             .err()
             .into_iter()
             .for_each(|schema_errors| {
@@ -581,11 +608,6 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             });
 
         if let Some(graft) = &self.0.graft {
-            if ENV_VARS.disable_grafts {
-                errors.push(SubgraphManifestValidationError::GraftBaseInvalid(
-                    "Grafting of subgraphs is currently disabled".to_owned(),
-                ));
-            }
             if validate_graft_base {
                 if let Err(graft_err) = graft.validate(store).await {
                     errors.push(graft_err);
@@ -649,6 +671,43 @@ impl<C: Blockchain> SubgraphManifest<C> {
             .iter()
             .map(|template| template.api_version())
             .chain(self.data_sources.iter().map(|source| source.api_version()))
+    }
+
+    pub fn deployment_features(&self) -> DeploymentFeatures {
+        let unified_api_version = self.unified_mapping_api_version().ok();
+        let api_version = unified_api_version
+            .map(|v| v.version().map(|v| v.to_string()))
+            .flatten();
+
+        let features: Vec<String> = self
+            .features
+            .iter()
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>();
+
+        let spec_version = self.spec_version.to_string();
+
+        let mut data_source_kinds = self
+            .data_sources
+            .iter()
+            .map(|ds| ds.kind().to_string())
+            .collect::<HashSet<_>>();
+
+        let data_source_template_kinds = self
+            .templates
+            .iter()
+            .map(|t| t.kind().to_string())
+            .collect::<Vec<_>>();
+
+        data_source_kinds.extend(data_source_template_kinds);
+
+        DeploymentFeatures {
+            id: self.id.to_string(),
+            api_version,
+            features,
+            spec_version,
+            data_source_kinds: data_source_kinds.into_iter().collect_vec(),
+        }
     }
 
     pub fn runtimes(&self) -> impl Iterator<Item = Arc<Vec<u8>>> + '_ {

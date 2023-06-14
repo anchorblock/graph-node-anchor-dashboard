@@ -69,8 +69,9 @@ those.
 ## IPFS
 
 - `GRAPH_IPFS_TIMEOUT`: timeout for IPFS, which includes requests for manifest files
-  and from mappings (in seconds, default is 30).
-- `GRAPH_MAX_IPFS_FILE_BYTES`: maximum size for a file that can be retrieved (in bytes, default is 256 MiB).
+  and from mappings (in seconds, default is 60).
+- `GRAPH_MAX_IPFS_FILE_BYTES`: maximum size for a file that can be retrieved by an `ipfs cat` call.
+  This affects both subgraph definition files and `file/ipfs` data sources. In bytes, default is 25 MiB.
 - `GRAPH_MAX_IPFS_MAP_FILE_SIZE`: maximum size of files that can be processed
   with `ipfs.map`. When a file is processed through `ipfs.map`, the entities
   generated from that are kept in memory until the entire file is done
@@ -78,15 +79,13 @@ those.
   may use (in bytes, defaults to 256MB).
 - `GRAPH_MAX_IPFS_CACHE_SIZE`: maximum number of files cached (defaults to 50).
 - `GRAPH_MAX_IPFS_CACHE_FILE_SIZE`: maximum size of each cached file (in bytes, defaults to 1MiB).
-- `GRAPH_IPFS_REQUEST_LIMIT`: Limits both concurrent and per second requests to IPFS for file data
-   sources. Defaults to 100.
+- `GRAPH_IPFS_REQUEST_LIMIT`: Limits the number of requests per second to IPFS for file data sources.
+   Defaults to 100.
 
 ## GraphQL
 
 - `GRAPH_GRAPHQL_QUERY_TIMEOUT`: maximum execution time for a graphql query, in
   seconds. Default is unlimited.
-- `SUBSCRIPTION_THROTTLE_INTERVAL`: while a subgraph is syncing, subscriptions
-  to that subgraph get updated at most this often, in ms. Default is 1000ms.
 - `GRAPH_GRAPHQL_MAX_COMPLEXITY`: maximum complexity for a graphql query. See
   [here](https://developer.github.com/v4/guides/resource-limitations) for what
   that means. Default is unlimited. Typical introspection queries have a
@@ -119,12 +118,17 @@ those.
   this variable is set to any value, `graph-node` will still accept GraphQL
   subscriptions, but they won't receive any updates.
 - `ENABLE_GRAPHQL_VALIDATIONS`: enables GraphQL validations, based on the GraphQL specification.
-  This will validate and ensure every query executes follows the execution rules.
+  This will validate and ensure every query executes follows the execution
+  rules. Default: `false`
 - `SILENT_GRAPHQL_VALIDATIONS`: If `ENABLE_GRAPHQL_VALIDATIONS` is enabled, you are also able to just
   silently print the GraphQL validation errors, without failing the actual query. Note: queries
-  might still fail as part of the later stage validations running, during GraphQL engine execution.
+  might still fail as part of the later stage validations running, during
+  GraphQL engine execution. Default: `true`
 - `GRAPH_GRAPHQL_DISABLE_BOOL_FILTERS`: disables the ability to use AND/OR
   filters. This is useful if we want to disable filters because of
+  performance reasons.
+- `GRAPH_GRAPHQL_DISABLE_CHILD_SORTING`: disables the ability to use child-based
+  sorting. This is useful if we want to disable child-based sorting because of
   performance reasons.
 - `GRAPH_GRAPHQL_TRACE_TOKEN`: the token to use to enable query tracing for
   a GraphQL request. If this is set, requests that have a header
@@ -219,3 +223,25 @@ those.
 - `GRAPH_FORK_BASE`: api url for where the graph node will fork from, use `https://api.thegraph.com/subgraphs/id/`
   for the hosted service.
 - `GRAPH_DEBUG_FORK`: the IPFS hash id of the subgraph to fork.
+- `GRAPH_STORE_HISTORY_SLACK_FACTOR`: How much history a subgraph with
+  limited history can accumulate before it will be pruned. Setting this to
+  1.1 means that the subgraph will be pruned every time it contains 10%
+  more history (in blocks) than its history limit. The default value is 1.2
+  and the value must be at least 1.01
+- `GRAPH_STORE_HISTORY_REBUILD_THRESHOLD`,
+  `GRAPH_STORE_HISTORY_DELETE_THRESHOLD`: when pruning, prune by copying
+  the entities we will keep to new tables if we estimate that we will
+  remove more than a factor of `REBUILD_THRESHOLD` of the deployment's
+  history. If we estimate to remove a factor between `REBUILD_THRESHOLD`
+  and `DELETE_THRESHOLD`, prune by deleting from the existing tables of the
+  deployment. If we estimate to remove less than `DELETE_THRESHOLD`
+  entities, do not change the table. Both settings are floats, and default
+  to 0.5 for the `REBUILD_THRESHOLD` and 0.05 for the `DELETE_THRESHOLD`;
+  they must be between 0 and 1, and `REBUILD_THRESHOLD` must be bigger than
+  `DELETE_THRESHOLD`.
+- `GRAPH_STORE_WRITE_BATCH_DURATION`: how long to accumulate changes during
+  syncing into a batch before a write has to happen in seconds. The default
+  is 300s. Setting this to 0 disables write batching.
+- `GRAPH_STORE_WRITE_BATCH_SIZE`: how many changes to accumulate during
+  syncing in kilobytes before a write has to happen. The default is 10_000
+  which corresponds to 10MB. Setting this to 0 disables write batching.

@@ -12,8 +12,8 @@ use graph::{
     data_source::{offchain, CausalityRegion, DataSource, TriggerData},
     ipfs_client::CidFile,
     prelude::{
-        BlockNumber, BlockState, CancelGuard, DeploymentHash, MetricsRegistry, RuntimeHostBuilder,
-        SubgraphInstanceMetrics, TriggerProcessor,
+        BlockNumber, BlockState, CancelGuard, CheapClone, DeploymentHash, MetricsRegistry,
+        RuntimeHostBuilder, SubgraphCountMetric, SubgraphInstanceMetrics, TriggerProcessor,
     },
     slog::Logger,
     tokio::sync::mpsc,
@@ -23,7 +23,31 @@ use std::sync::{Arc, RwLock};
 
 use self::instance::SubgraphInstance;
 
-pub type SharedInstanceKeepAliveMap = Arc<RwLock<HashMap<DeploymentId, CancelGuard>>>;
+#[derive(Clone, Debug)]
+pub struct SubgraphKeepAlive {
+    alive_map: Arc<RwLock<HashMap<DeploymentId, CancelGuard>>>,
+    sg_metrics: Arc<SubgraphCountMetric>,
+}
+
+impl CheapClone for SubgraphKeepAlive {}
+
+impl SubgraphKeepAlive {
+    pub fn new(sg_metrics: Arc<SubgraphCountMetric>) -> Self {
+        Self {
+            sg_metrics,
+            alive_map: Arc::new(RwLock::new(HashMap::default())),
+        }
+    }
+
+    pub fn remove(&self, deployment_id: &DeploymentId) {
+        self.alive_map.write().unwrap().remove(deployment_id);
+        self.sg_metrics.running_count.dec();
+    }
+    pub fn insert(&self, deployment_id: DeploymentId, guard: CancelGuard) {
+        self.alive_map.write().unwrap().insert(deployment_id, guard);
+        self.sg_metrics.running_count.inc();
+    }
+}
 
 // The context keeps track of mutable in-memory state that is retained across blocks.
 //
@@ -36,7 +60,7 @@ where
     C: Blockchain,
 {
     instance: SubgraphInstance<C, T>,
-    pub instances: SharedInstanceKeepAliveMap,
+    pub instances: SubgraphKeepAlive,
     pub filter: C::TriggerFilter,
     pub offchain_monitor: OffchainMonitor,
     trigger_processor: Box<dyn TriggerProcessor<C, T>>,
@@ -45,7 +69,7 @@ where
 impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     pub fn new(
         instance: SubgraphInstance<C, T>,
-        instances: SharedInstanceKeepAliveMap,
+        instances: SubgraphKeepAlive,
         filter: C::TriggerFilter,
         offchain_monitor: OffchainMonitor,
         trigger_processor: Box<dyn TriggerProcessor<C, T>>,
@@ -69,10 +93,11 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
+        instrument: bool,
     ) -> Result<BlockState<C>, MappingError> {
         self.process_trigger_in_hosts(
             logger,
-            self.instance.hosts(),
+            self.instance.hosts_for_trigger(trigger),
             block,
             trigger,
             state,
@@ -80,6 +105,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
             causality_region,
             debug_fork,
             subgraph_metrics,
+            instrument,
         )
         .await
     }
@@ -87,7 +113,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     pub async fn process_trigger_in_hosts(
         &self,
         logger: &Logger,
-        hosts: &[Arc<T::Host>],
+        hosts: Box<dyn Iterator<Item = &T::Host> + Send + '_>,
         block: &Arc<C::Block>,
         trigger: &TriggerData<C>,
         state: BlockState<C>,
@@ -95,6 +121,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
+        instrument: bool,
     ) -> Result<BlockState<C>, MappingError> {
         self.trigger_processor
             .process_trigger(
@@ -107,6 +134,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
                 causality_region,
                 debug_fork,
                 subgraph_metrics,
+                instrument,
             )
             .await
     }
@@ -157,17 +185,19 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
 
 pub struct OffchainMonitor {
     ipfs_monitor: PollingMonitor<CidFile>,
-    ipfs_monitor_rx: mpsc::Receiver<(CidFile, Bytes)>,
+    ipfs_monitor_rx: mpsc::UnboundedReceiver<(CidFile, Bytes)>,
 }
 
 impl OffchainMonitor {
     pub fn new(
         logger: Logger,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         subgraph_hash: &DeploymentHash,
         ipfs_service: IpfsService,
     ) -> Self {
-        let (ipfs_monitor_tx, ipfs_monitor_rx) = mpsc::channel(10);
+        // The channel is unbounded, as it is expected that `fn ready_offchain_events` is called
+        // frequently, or at least with the same frequency that requests are sent.
+        let (ipfs_monitor_tx, ipfs_monitor_rx) = mpsc::unbounded_channel();
         let ipfs_monitor = spawn_monitor(
             ipfs_service,
             ipfs_monitor_tx,

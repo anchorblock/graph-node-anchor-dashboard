@@ -5,12 +5,20 @@ use std::{
 
 use graph::prelude::BLOCK_NUMBER_MAX;
 
+use crate::block_range::CAUSALITY_REGION_COLUMN;
 use crate::relational::{
-    Catalog, ColumnType, BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BYTE_ARRAY_PREFIX_SIZE,
-    STRING_PREFIX_SIZE, VID_COLUMN,
+    ColumnType, BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE,
+    VID_COLUMN,
 };
 
-use super::{Column, Layout, SqlName, Table};
+use super::{Catalog, Column, Layout, SqlName, Table};
+
+// In debug builds (for testing etc.) unconditionally create exclusion constraints, in release
+// builds for production, skip them
+#[cfg(debug_assertions)]
+const CREATE_EXCLUSION_CONSTRAINT: bool = true;
+#[cfg(not(debug_assertions))]
+const CREATE_EXCLUSION_CONSTRAINT: bool = false;
 
 impl Layout {
     /// Generate the DDL for the entire layout, i.e., all `create table`
@@ -30,7 +38,7 @@ impl Layout {
         tables.sort_by_key(|table| table.position);
         // Output 'create table' statements for all tables
         for table in tables {
-            table.as_ddl(&mut out)?;
+            table.as_ddl(&self.catalog, &mut out)?;
         }
 
         Ok(out)
@@ -77,30 +85,38 @@ impl Table {
         fn columns_ddl(table: &Table) -> Result<String, fmt::Error> {
             let mut cols = String::new();
             let mut first = true;
+
+            if table.has_causality_region {
+                first = false;
+                write!(
+                    cols,
+                    "{causality_region}     int not null",
+                    causality_region = CAUSALITY_REGION_COLUMN
+                )?;
+            }
+
             for column in &table.columns {
                 if !first {
                     writeln!(cols, ",")?;
-                } else {
-                    writeln!(cols)?;
+                    write!(cols, "        ")?;
                 }
-                write!(cols, "    ")?;
                 column.as_ddl(&mut cols)?;
                 first = false;
             }
+
             Ok(cols)
         }
 
         if self.immutable {
             writeln!(
                 out,
-                r#"
-            create table {qname} (
-                {vid}                  bigserial primary key,
-                {block}                int not null,
-                {cols},
-                unique({id})
-            );
-            "#,
+                "
+    create table {qname} (
+        {vid}                  bigserial primary key,
+        {block}                int not null,\n\
+        {cols},
+        unique({id})
+    );",
                 qname = self.qualified_name,
                 cols = columns_ddl(self)?,
                 vid = VID_COLUMN,
@@ -111,29 +127,30 @@ impl Table {
             writeln!(
                 out,
                 r#"
-            create table {qname} (
-                {vid}                  bigserial primary key,
-                {block_range}          int4range not null,
-                {cols}
-            );
-            "#,
+    create table {qname} (
+        {vid}                  bigserial primary key,
+        {block_range}          int4range not null,
+        {cols}
+    );"#,
                 qname = self.qualified_name,
                 cols = columns_ddl(self)?,
                 vid = VID_COLUMN,
                 block_range = BLOCK_RANGE_COLUMN
             )?;
 
-            self.exclusion_ddl(out, Catalog::create_exclusion_constraint())
+            self.exclusion_ddl(out)
         }
     }
 
-    fn create_time_travel_indexes(&self, out: &mut String) -> fmt::Result {
+    fn create_time_travel_indexes(&self, catalog: &Catalog, out: &mut String) -> fmt::Result {
+        let (int4, int8) = catalog.minmax_ops();
+
         if self.immutable {
             write!(
                 out,
                 "create index brin_{table_name}\n    \
                 on {qname}\n \
-                   using brin({block}, vid);\n",
+                   using brin({block} {int4}, vid {int8});\n",
                 table_name = self.name,
                 qname = self.qualified_name,
                 block = BLOCK_COLUMN
@@ -162,7 +179,7 @@ impl Table {
             // entities are stored.
             write!(out,"create index brin_{table_name}\n    \
                 on {qname}\n \
-                   using brin(lower(block_range), coalesce(upper(block_range), {block_max}), vid);\n",
+                   using brin(lower(block_range) {int4}, coalesce(upper(block_range), {block_max}) {int4}, vid {int8});\n",
                 table_name = self.name,
                 qname = self.qualified_name,
                 block_max = BLOCK_NUMBER_MAX)?;
@@ -182,22 +199,33 @@ impl Table {
     }
 
     fn create_attribute_indexes(&self, out: &mut String) -> fmt::Result {
-        // Create indexes. Skip columns whose type is an array of enum,
-        // since there is no good way to index them with Postgres 9.6.
-        // Once we move to Postgres 11, we can enable that
-        // (tracked in graph-node issue #1330)
-        for (i, column) in self
+        // Create indexes.
+
+        // Skip columns whose type is an array of enum, since there is no
+        // good way to index them with Postgres 9.6. Once we move to
+        // Postgres 11, we can enable that (tracked in graph-node issue
+        // #1330)
+        let not_enum_list = |col: &&Column| !(col.is_list() && col.is_enum());
+
+        // We create a unique index on `id` in `create_table`
+        // and don't need an explicit attribute index
+        let not_immutable_pk = |col: &&Column| !(self.immutable && col.is_primary_key());
+
+        // GIN indexes on numeric types are not very useful, but expensive
+        // to build
+        let not_numeric_list = |col: &&Column| {
+            !(col.is_list()
+                && [ColumnType::BigDecimal, ColumnType::BigInt, ColumnType::Int]
+                    .contains(&col.column_type))
+        };
+        let columns = self
             .columns
             .iter()
-            .filter(|col| !(col.is_list() && col.is_enum()))
-            .enumerate()
-        {
-            if self.immutable && column.is_primary_key() {
-                // We create a unique index on `id` in `create_table`
-                // and don't need an explicit attribute index
-                continue;
-            }
+            .filter(not_enum_list)
+            .filter(not_immutable_pk)
+            .filter(not_numeric_list);
 
+        for (i, column) in columns.enumerate() {
             let (method, index_expr) = if column.is_reference() && !column.is_list() {
                 // For foreign keys, index the key together with the block range
                 // since we almost always also have a block_range clause in
@@ -260,20 +288,28 @@ impl Table {
     ///
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
-    pub(crate) fn as_ddl(&self, out: &mut String) -> fmt::Result {
+    pub(crate) fn as_ddl(&self, catalog: &Catalog, out: &mut String) -> fmt::Result {
         self.create_table(out)?;
-        self.create_time_travel_indexes(out)?;
+        self.create_time_travel_indexes(catalog, out)?;
         self.create_attribute_indexes(out)
     }
 
-    pub fn exclusion_ddl(&self, out: &mut String, as_constraint: bool) -> fmt::Result {
+    pub fn exclusion_ddl(&self, out: &mut String) -> fmt::Result {
+        // Tables with causality regions need to use exclusion constraints for correctness,
+        // to catch violations of write isolation.
+        let as_constraint = self.has_causality_region || CREATE_EXCLUSION_CONSTRAINT;
+
+        self.exclusion_ddl_inner(out, as_constraint)
+    }
+
+    // `pub` for tests.
+    pub(crate) fn exclusion_ddl_inner(&self, out: &mut String, as_constraint: bool) -> fmt::Result {
         if as_constraint {
             writeln!(
                 out,
-                r#"
-        alter table {qname}
-          add constraint {bare_name}_{id}_{block_range}_excl exclude using gist ({id} with =, {block_range} with &&);
-               "#,
+                "
+    alter table {qname}
+        add constraint {bare_name}_{id}_{block_range}_excl exclude using gist ({id} with =, {block_range} with &&);",
                 qname = self.qualified_name,
                 bare_name = self.name,
                 id = self.primary_key().name,
@@ -282,10 +318,10 @@ impl Table {
         } else {
             writeln!(
                 out,
-                r#"
+                "
         create index {bare_name}_{id}_{block_range}_excl on {qname}
          using gist ({id}, {block_range});
-               "#,
+               ",
                 qname = self.qualified_name,
                 bare_name = self.name,
                 id = self.primary_key().name,
@@ -303,7 +339,6 @@ impl Column {
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
     fn as_ddl(&self, out: &mut String) -> fmt::Result {
-        write!(out, "    ")?;
         write!(out, "{:20} {}", self.name.quoted(), self.sql_type())?;
         if self.is_list() {
             write!(out, "[]")?;

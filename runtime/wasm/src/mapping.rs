@@ -9,8 +9,9 @@ use graph::data_source::{MappingTrigger, TriggerWithHandler};
 use graph::prelude::*;
 use graph::runtime::gas::Gas;
 use std::collections::BTreeMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::thread;
+use std::{panic, thread};
 
 /// Spawn a wasm module in its own thread.
 pub fn spawn_module<C: Blockchain>(
@@ -52,14 +53,32 @@ where
                     result_sender,
                 } = request;
 
-                let result = instantiate_module_and_handle_trigger(
-                    valid_module.cheap_clone(),
-                    ctx,
-                    trigger,
-                    host_metrics.cheap_clone(),
-                    timeout,
-                    experimental_features,
-                );
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    instantiate_module_and_handle_trigger(
+                        valid_module.cheap_clone(),
+                        ctx,
+                        trigger,
+                        host_metrics.cheap_clone(),
+                        timeout,
+                        experimental_features,
+                    )
+                }));
+
+                let result = match result {
+                    Ok(result) => result,
+                    Err(panic_info) => {
+                        let err_msg = if let Some(payload) = panic_info
+                            .downcast_ref::<String>()
+                            .map(String::as_str)
+                            .or(panic_info.downcast_ref::<&str>().copied())
+                        {
+                            anyhow!("Subgraph panicked with message: {}", payload)
+                        } else {
+                            anyhow!("Subgraph panicked with an unknown payload.")
+                        };
+                        Err(MappingError::Unknown(err_msg))
+                    }
+                };
 
                 result_sender
                     .send(result)
@@ -124,6 +143,10 @@ pub struct MappingContext<C: Blockchain> {
     pub proof_of_indexing: SharedProofOfIndexing,
     pub host_fns: Arc<Vec<HostFn>>,
     pub debug_fork: Option<Arc<dyn SubgraphFork>>,
+    /// Logger for messages coming from mappings
+    pub mapping_logger: Logger,
+    /// Whether to log details about host fn execution
+    pub instrument: bool,
 }
 
 impl<C: Blockchain> MappingContext<C> {
@@ -136,6 +159,8 @@ impl<C: Blockchain> MappingContext<C> {
             proof_of_indexing: self.proof_of_indexing.cheap_clone(),
             host_fns: self.host_fns.cheap_clone(),
             debug_fork: self.debug_fork.cheap_clone(),
+            mapping_logger: Logger::new(&self.logger, o!("component" => "UserMapping")),
+            instrument: self.instrument,
         }
     }
 }
@@ -194,7 +219,7 @@ impl ValidModule {
             .unwrap(); // Safe because this only panics if size passed is 0.
 
         let engine = &wasmtime::Engine::new(&config)?;
-        let module = wasmtime::Module::from_binary(&engine, &raw_module)?;
+        let module = wasmtime::Module::from_binary(engine, &raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
 

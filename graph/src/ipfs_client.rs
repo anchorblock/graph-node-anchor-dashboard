@@ -110,7 +110,9 @@ pub struct AddResponse {
 #[derive(Clone)]
 pub struct IpfsClient {
     base: Arc<Uri>,
-    client: Arc<reqwest::Client>,
+    // reqwest::Client doesn't need to be `Arc` because it has one internally
+    // already.
+    client: reqwest::Client,
 }
 
 impl CheapClone for IpfsClient {
@@ -125,14 +127,14 @@ impl CheapClone for IpfsClient {
 impl IpfsClient {
     pub fn new(base: &str) -> Result<Self, Error> {
         Ok(IpfsClient {
-            client: Arc::new(reqwest::Client::new()),
+            client: reqwest::Client::new(),
             base: Arc::new(Uri::from_str(base)?),
         })
     }
 
     pub fn localhost() -> Self {
         IpfsClient {
-            client: Arc::new(reqwest::Client::new()),
+            client: reqwest::Client::new(),
             base: Arc::new(Uri::from_str("http://localhost:5001").unwrap()),
         }
     }
@@ -256,17 +258,14 @@ mod test {
                 name: "correct no slashes, no file",
                 input: cid_str.to_string(),
                 path: cid_str.to_string(),
-                expected: Ok(CidFile {
-                    cid: cid,
-                    path: None,
-                }),
+                expected: Ok(CidFile { cid, path: None }),
             },
             Case {
                 name: "correct with file path",
                 input: format!("{}/file.json", cid),
                 path: format!("{}/file.json", cid_str),
                 expected: Ok(CidFile {
-                    cid: cid,
+                    cid,
                     path: Some("file.json".into()),
                 }),
             },
@@ -274,10 +273,7 @@ mod test {
                 name: "correct cid with trailing slash",
                 input: format!("{}/", cid),
                 path: format!("{}", cid),
-                expected: Ok(CidFile {
-                    cid: cid,
-                    path: None,
-                }),
+                expected: Ok(CidFile { cid, path: None }),
             },
             Case {
                 name: "incorrect, empty",
@@ -290,7 +286,7 @@ mod test {
                 input: format!("{}//", cid),
                 path: format!("{}//", cid),
                 expected: Ok(CidFile {
-                    cid: cid,
+                    cid,
                     path: Some("/".into()),
                 }),
             },

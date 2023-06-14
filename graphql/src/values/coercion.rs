@@ -1,6 +1,6 @@
-use crate::schema;
 use graph::prelude::s::{EnumType, InputValue, ScalarType, Type, TypeDefinition};
 use graph::prelude::{q, r, QueryExecutionError};
+use graph::schema;
 use std::collections::BTreeMap;
 use std::convert::TryFrom;
 
@@ -41,6 +41,10 @@ impl MaybeCoercible<ScalarType> for q::Value {
                 } else {
                     Err(q::Value::Int(num))
                 }
+            }
+            ("Int8", q::Value::Int(num)) => {
+                let n = num.as_i64().ok_or_else(|| q::Value::Int(num.clone()))?;
+                Ok(r::Value::Int(n))
             }
             ("String", q::Value::String(s)) => Ok(r::Value::String(s)),
             ("ID", q::Value::String(s)) => Ok(r::Value::String(s)),
@@ -129,7 +133,7 @@ pub(crate) fn coerce_input_value<'a>(
             return if schema::ast::is_non_null_type(&def.value_type) {
                 Err(QueryExecutionError::MissingArgumentError(
                     def.position,
-                    def.name.to_owned(),
+                    def.name.clone(),
                 ))
             } else {
                 Ok(None)
@@ -140,7 +144,7 @@ pub(crate) fn coerce_input_value<'a>(
 
     Ok(Some(
         coerce_value(value, &def.value_type, resolver).map_err(|val| {
-            QueryExecutionError::InvalidArgumentError(def.position, def.name.to_owned(), val.into())
+            QueryExecutionError::InvalidArgumentError(def.position, def.name.clone(), val.into())
         })?,
     ))
 }
@@ -309,7 +313,7 @@ mod tests {
             Ok(Value::String("23".to_string()))
         );
         assert_eq!(
-            coerce_to_definition(Value::Int((-5 as i32).into()), "", &resolver,),
+            coerce_to_definition(Value::Int((-5_i32).into()), "", &resolver,),
             Ok(Value::String("-5".to_string())),
         );
 
@@ -390,7 +394,22 @@ mod tests {
             Ok(Value::String("1234".to_string()))
         );
         assert_eq!(
-            coerce_to_definition(Value::Int((-1234 as i32).into()), "", &resolver,),
+            coerce_to_definition(Value::Int((-1234_i32).into()), "", &resolver,),
+            Ok(Value::String("-1234".to_string()))
+        );
+    }
+
+    #[test]
+    fn coerce_int8_scalar() {
+        let int8_type = TypeDefinition::Scalar(ScalarType::new("Int8".to_string()));
+        let resolver = |_: &str| Some(&int8_type);
+
+        assert_eq!(
+            coerce_to_definition(Value::Int(1234.into()), "", &resolver),
+            Ok(Value::String("1234".to_string()))
+        );
+        assert_eq!(
+            coerce_to_definition(Value::Int((-1234_i32).into()), "", &resolver,),
             Ok(Value::String("-1234".to_string()))
         );
     }
@@ -417,8 +436,8 @@ mod tests {
             Ok(Value::Int(13289123.into()))
         );
         assert_eq!(
-            coerce_to_definition(Value::Int((-13289123 as i32).into()), "", &resolver,),
-            Ok(Value::Int((-13289123 as i32).into()))
+            coerce_to_definition(Value::Int((-13289123_i32).into()), "", &resolver,),
+            Ok(Value::Int((-13289123_i32).into()))
         );
     }
 }

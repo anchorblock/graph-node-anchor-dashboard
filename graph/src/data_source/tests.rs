@@ -1,6 +1,10 @@
 use cid::Cid;
 
-use crate::{components::subgraph::Entity, ipfs_client::CidFile, prelude::Link};
+use crate::{
+    blockchain::mock::{MockBlockchain, MockDataSource},
+    ipfs_client::CidFile,
+    prelude::Link,
+};
 
 use super::{
     offchain::{Mapping, Source},
@@ -34,7 +38,7 @@ fn offchain_duplicate() {
     assert!(!a.is_duplicate_of(&c));
 
     let mut c = a.clone();
-    c.context = Arc::new(Some(Entity::new()));
+    c.context = Arc::new(Some(DataSourceContext::new()));
     assert!(!a.is_duplicate_of(&c));
 }
 
@@ -43,6 +47,24 @@ fn offchain_duplicate() {
 fn offchain_mark_processed_error() {
     let x = new_datasource();
     x.mark_processed_at(-1)
+}
+
+#[test]
+fn data_source_helpers() {
+    let offchain = new_datasource();
+    let offchain_ds = DataSource::<MockBlockchain>::Offchain(offchain.clone());
+    assert!(offchain_ds.causality_region() == offchain.causality_region);
+    assert!(offchain_ds
+        .as_offchain()
+        .unwrap()
+        .is_duplicate_of(&offchain));
+
+    let onchain = DataSource::<MockBlockchain>::Onchain(MockDataSource {
+        api_version: Version::new(1, 0, 0),
+        kind: "mock/kind".into(),
+    });
+    assert!(onchain.causality_region() == CausalityRegion::ONCHAIN);
+    assert!(onchain.as_offchain().is_none());
 }
 
 fn new_datasource() -> offchain::DataSource {

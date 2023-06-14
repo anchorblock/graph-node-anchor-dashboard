@@ -1,4 +1,5 @@
 use itertools::Itertools;
+use pretty_assertions::assert_eq;
 
 use super::*;
 
@@ -8,10 +9,11 @@ const ID_TYPE: ColumnType = ColumnType::String;
 
 fn test_layout(gql: &str) -> Layout {
     let subgraph = DeploymentHash::new("subgraph").unwrap();
-    let schema = Schema::parse(gql, subgraph.clone()).expect("Test schema invalid");
+    let schema = InputSchema::parse(gql, subgraph.clone()).expect("Test schema invalid");
     let namespace = Namespace::new("sgd0815".to_owned()).unwrap();
     let site = Arc::new(make_dummy_site(subgraph, namespace, "anet".to_string()));
-    let catalog = Catalog::for_tests(site.clone()).expect("Can not create catalog");
+    let catalog = Catalog::for_tests(site.clone(), BTreeSet::from_iter(["FileThing".into()]))
+        .expect("Can not create catalog");
     Layout::new(site, &schema, catalog).expect("Failed to construct Layout")
 }
 
@@ -57,7 +59,7 @@ fn check_eqv(left: &str, right: &str) {
 fn generate_ddl() {
     let layout = test_layout(THING_GQL);
     let sql = layout.as_ddl().expect("Failed to generate DDL");
-    check_eqv(THING_DDL, &sql);
+    assert_eq!(THING_DDL, &sql); // Use `assert_eq!` to also test the formatting.
 
     let layout = test_layout(MUSIC_GQL);
     let sql = layout.as_ddl().expect("Failed to generate DDL");
@@ -86,7 +88,7 @@ fn exlusion_ddl() {
     // When `as_constraint` is false, just create an index
     let mut out = String::new();
     table
-        .exclusion_ddl(&mut out, false)
+        .exclusion_ddl_inner(&mut out, false)
         .expect("can write exclusion DDL");
     check_eqv(
         r#"create index thing_id_block_range_excl on "sgd0815"."thing" using gist (id, block_range);"#,
@@ -96,7 +98,7 @@ fn exlusion_ddl() {
     // When `as_constraint` is true, add an exclusion constraint
     let mut out = String::new();
     table
-        .exclusion_ddl(&mut out, true)
+        .exclusion_ddl_inner(&mut out, true)
         .expect("can write exclusion DDL");
     check_eqv(
         r#"alter table "sgd0815"."thing" add constraint thing_id_block_range_excl exclude using gist (id with =, block_range with &&);"#,
@@ -198,23 +200,30 @@ const THING_GQL: &str = r#"
             bytes: Bytes,
             bigInt: BigInt,
             color: Color,
-        }"#;
+        }
+
+        type FileThing @entity {
+            id: ID!
+        }
+        "#;
 
 const THING_DDL: &str = r#"create type sgd0815."color"
     as enum ('BLUE', 'red', 'yellow');
 create type sgd0815."size"
     as enum ('large', 'medium', 'small');
-create table "sgd0815"."thing" (
+
+    create table "sgd0815"."thing" (
         vid                  bigserial primary key,
         block_range          int4range not null,
         "id"                 text not null,
         "big_thing"          text not null
-);
-alter table "sgd0815"."thing"
-  add constraint thing_id_block_range_excl exclude using gist (id with =, block_range with &&);
+    );
+
+    alter table "sgd0815"."thing"
+        add constraint thing_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_thing
     on "sgd0815"."thing"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index thing_block_range_closed
     on "sgd0815"."thing"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -223,7 +232,8 @@ create index attr_0_0_thing_id
 create index attr_0_1_thing_big_thing
     on "sgd0815"."thing" using gist("big_thing", block_range);
 
-create table "sgd0815"."scalar" (
+
+    create table "sgd0815"."scalar" (
         vid                  bigserial primary key,
         block_range          int4range not null,
         "id"                 text not null,
@@ -234,12 +244,13 @@ create table "sgd0815"."scalar" (
         "bytes"              bytea,
         "big_int"            numeric,
         "color"              "sgd0815"."color"
-);
-alter table "sgd0815"."scalar"
-  add constraint scalar_id_block_range_excl exclude using gist (id with =, block_range with &&);
+    );
+
+    alter table "sgd0815"."scalar"
+        add constraint scalar_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_scalar
     on "sgd0815"."scalar"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index scalar_block_range_closed
     on "sgd0815"."scalar"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -259,6 +270,25 @@ create index attr_1_6_scalar_big_int
     on "sgd0815"."scalar" using btree("big_int");
 create index attr_1_7_scalar_color
     on "sgd0815"."scalar" using btree("color");
+
+
+    create table "sgd0815"."file_thing" (
+        vid                  bigserial primary key,
+        block_range          int4range not null,
+        causality_region     int not null,
+        "id"                 text not null
+    );
+
+    alter table "sgd0815"."file_thing"
+        add constraint file_thing_id_block_range_excl exclude using gist (id with =, block_range with &&);
+create index brin_file_thing
+    on "sgd0815"."file_thing"
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
+create index file_thing_block_range_closed
+    on "sgd0815"."file_thing"(coalesce(upper(block_range), 2147483647))
+ where coalesce(upper(block_range), 2147483647) < 2147483647;
+create index attr_2_0_file_thing_id
+    on "sgd0815"."file_thing" using btree("id");
 
 "#;
 
@@ -301,7 +331,7 @@ alter table "sgd0815"."musician"
   add constraint musician_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_musician
     on "sgd0815"."musician"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index musician_block_range_closed
     on "sgd0815"."musician"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -325,7 +355,7 @@ alter table "sgd0815"."band"
   add constraint band_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_band
     on "sgd0815"."band"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index band_block_range_closed
     on "sgd0815"."band"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -347,10 +377,10 @@ create table "sgd0815"."song" (
 );
 create index brin_song
     on "sgd0815"."song"
- using brin(block$, vid);
-create index attr_2_1_song_title
+ using brin(block$ int4_minmax_ops, vid int8_minmax_ops);
+create index attr_2_0_song_title
     on "sgd0815"."song" using btree(left("title", 256));
-create index attr_2_2_song_written_by
+create index attr_2_1_song_written_by
     on "sgd0815"."song" using btree("written_by", block$);
 
 create table "sgd0815"."song_stat" (
@@ -363,7 +393,7 @@ alter table "sgd0815"."song_stat"
   add constraint song_stat_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_song_stat
     on "sgd0815"."song_stat"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index song_stat_block_range_closed
     on "sgd0815"."song_stat"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -405,7 +435,7 @@ alter table "sgd0815"."animal"
   add constraint animal_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_animal
     on "sgd0815"."animal"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index animal_block_range_closed
     on "sgd0815"."animal"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -423,7 +453,7 @@ alter table "sgd0815"."forest"
   add constraint forest_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_forest
     on "sgd0815"."forest"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index forest_block_range_closed
     on "sgd0815"."forest"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -441,7 +471,7 @@ alter table "sgd0815"."habitat"
   add constraint habitat_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_habitat
     on "sgd0815"."habitat"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index habitat_block_range_closed
     on "sgd0815"."habitat"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -497,7 +527,7 @@ alter table "sgd0815"."animal"
   add constraint animal_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_animal
     on "sgd0815"."animal"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index animal_block_range_closed
     on "sgd0815"."animal"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -522,7 +552,7 @@ alter table "sgd0815"."forest"
 
 create index brin_forest
     on "sgd0815"."forest"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index forest_block_range_closed
     on "sgd0815"."forest"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -540,7 +570,7 @@ alter table "sgd0815"."habitat"
   add constraint habitat_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_habitat
     on "sgd0815"."habitat"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index habitat_block_range_closed
     on "sgd0815"."habitat"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;
@@ -576,7 +606,7 @@ alter table "sgd0815"."thing"
   add constraint thing_id_block_range_excl exclude using gist (id with =, block_range with &&);
 create index brin_thing
     on "sgd0815"."thing"
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
+ using brin(lower(block_range) int4_minmax_ops, coalesce(upper(block_range), 2147483647) int4_minmax_ops, vid int8_minmax_ops);
 create index thing_block_range_closed
     on "sgd0815"."thing"(coalesce(upper(block_range), 2147483647))
  where coalesce(upper(block_range), 2147483647) < 2147483647;

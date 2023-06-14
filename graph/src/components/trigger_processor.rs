@@ -16,10 +16,10 @@ where
     C: Blockchain,
     T: RuntimeHostBuilder<C>,
 {
-    async fn process_trigger(
-        &self,
+    async fn process_trigger<'a>(
+        &'a self,
         logger: &Logger,
-        hosts: &[Arc<T::Host>],
+        hosts: Box<dyn Iterator<Item = &T::Host> + Send + 'a>,
         block: &Arc<C::Block>,
         trigger: &TriggerData<C>,
         mut state: BlockState<C>,
@@ -27,5 +27,6 @@ where
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
+        instrument: bool,
     ) -> Result<BlockState<C>, MappingError>;
 }

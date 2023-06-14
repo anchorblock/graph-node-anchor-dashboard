@@ -8,8 +8,8 @@ mod tests;
 
 use crate::{
     blockchain::{
-        BlockPtr, Blockchain, DataSource as _, DataSourceTemplate as _, TriggerData as _,
-        UnresolvedDataSource as _, UnresolvedDataSourceTemplate as _,
+        BlockPtr, Blockchain, DataSource as _, DataSourceTemplate as _, MappingTriggerTrait,
+        TriggerData as _, UnresolvedDataSource as _, UnresolvedDataSourceTemplate as _,
     },
     components::{
         link_resolver::LinkResolver,
@@ -81,7 +81,7 @@ impl EntityTypeAccess {
 impl<C: Blockchain> DataSource<C> {
     pub fn as_onchain(&self) -> Option<&C::DataSource> {
         match self {
-            Self::Onchain(ds) => Some(&ds),
+            Self::Onchain(ds) => Some(ds),
             Self::Offchain(_) => None,
         }
     }
@@ -89,7 +89,7 @@ impl<C: Blockchain> DataSource<C> {
     pub fn as_offchain(&self) -> Option<&offchain::DataSource> {
         match self {
             Self::Onchain(_) => None,
-            Self::Offchain(ds) => Some(&ds),
+            Self::Offchain(ds) => Some(ds),
         }
     }
 
@@ -206,6 +206,13 @@ impl<C: Blockchain> DataSource<C> {
             Self::Offchain(_) => vec![],
         }
     }
+
+    pub fn causality_region(&self) -> CausalityRegion {
+        match self {
+            Self::Onchain(_) => CausalityRegion::ONCHAIN,
+            Self::Offchain(ds) => ds.causality_region,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -250,6 +257,13 @@ impl<C: Blockchain> DataSourceTemplate<C> {
         }
     }
 
+    pub fn as_offchain(&self) -> Option<&offchain::DataSourceTemplate> {
+        match self {
+            Self::Onchain(_) => None,
+            Self::Offchain(t) => Some(t),
+        }
+    }
+
     pub fn into_onchain(self) -> Option<C::DataSourceTemplate> {
         match self {
             Self::Onchain(ds) => Some(ds),
@@ -282,6 +296,13 @@ impl<C: Blockchain> DataSourceTemplate<C> {
         match self {
             Self::Onchain(ds) => ds.manifest_idx(),
             Self::Offchain(ds) => ds.manifest_idx,
+        }
+    }
+
+    pub fn kind(&self) -> String {
+        match self {
+            Self::Onchain(ds) => ds.kind().to_string(),
+            Self::Offchain(ds) => ds.kind.to_owned(),
         }
     }
 }
@@ -393,12 +414,28 @@ impl<C: Blockchain> TriggerData<C> {
             Self::Offchain(trigger) => format!("{:?}", trigger.source),
         }
     }
+
+    pub fn address_match(&self) -> Option<Vec<u8>> {
+        match self {
+            Self::Onchain(trigger) => trigger.address_match().map(|address| address.to_owned()),
+            Self::Offchain(trigger) => trigger.source.address(),
+        }
+    }
 }
 
 #[derive(Debug)]
 pub enum MappingTrigger<C: Blockchain> {
     Onchain(C::MappingTrigger),
     Offchain(offchain::TriggerData),
+}
+
+impl<C: Blockchain> MappingTrigger<C> {
+    pub fn error_context(&self) -> Option<String> {
+        match self {
+            Self::Onchain(trigger) => Some(trigger.error_context()),
+            Self::Offchain(_) => None, // TODO: Add error context for offchain triggers
+        }
+    }
 }
 
 macro_rules! clone_data_source {

@@ -5,7 +5,7 @@ use std::time::Duration;
 use graph::data::{
     graphql::effort::LoadManager,
     query::{QueryResults, QueryTarget},
-    value::Object,
+    value::{Object, Word},
 };
 use graph::prelude::*;
 
@@ -56,15 +56,11 @@ impl GraphQlRunner for TestGraphQlRunner {
                 == &r::Value::String(String::from("John"))
         {
             Object::from_iter(
-                vec![(String::from("name"), r::Value::String(String::from("John")))].into_iter(),
+                vec![(Word::from("name"), r::Value::String(String::from("John")))].into_iter(),
             )
         } else {
             Object::from_iter(
-                vec![(
-                    String::from("name"),
-                    r::Value::String(String::from("Jordi")),
-                )]
-                .into_iter(),
+                vec![(Word::from("name"), r::Value::String(String::from("Jordi")))].into_iter(),
             )
         }
         .into()
@@ -101,7 +97,7 @@ mod test {
         runtime
             .block_on(async {
                 let logger = Logger::root(slog::Discard, o!());
-                let logger_factory = LoggerFactory::new(logger, None);
+                let logger_factory = LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
                 let id = USERS.clone();
                 let query_runner = Arc::new(TestGraphQlRunner);
                 let node_id = NodeId::new("test").unwrap();
@@ -142,7 +138,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
             let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
@@ -222,7 +219,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
             let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
@@ -267,7 +265,8 @@ mod test {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _ = runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
             let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();

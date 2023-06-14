@@ -6,9 +6,10 @@ use crate::components::server::index_node::VersionInfo;
 use crate::components::transaction_receipt;
 use crate::components::versions::ApiVersion;
 use crate::data::query::Trace;
-use crate::data::subgraph::status;
-use crate::data::value::Word;
+use crate::data::subgraph::{status, DeploymentFeatures};
+use crate::data::value::Object;
 use crate::data::{query::QueryTarget, subgraph::schema::*};
+use crate::schema::{ApiSchema, InputSchema};
 
 pub trait SubscriptionManager: Send + Sync + 'static {
     /// Subscribe to changes for specific subgraphs and entities.
@@ -67,8 +68,9 @@ pub trait SubgraphStore: Send + Sync + 'static {
     fn create_subgraph_deployment(
         &self,
         name: SubgraphName,
-        schema: &Schema,
+        schema: &InputSchema,
         deployment: DeploymentCreate,
+        deployment_features: DeploymentFeatures,
         node_id: NodeId,
         network: String,
         mode: SubgraphVersionSwitchingMode,
@@ -94,7 +96,19 @@ pub trait SubgraphStore: Send + Sync + 'static {
 
     fn assigned_node(&self, deployment: &DeploymentLocator) -> Result<Option<NodeId>, StoreError>;
 
+    /// Returns Option<(node_id,is_paused)> where `node_id` is the node that
+    /// the subgraph is assigned to, and `is_paused` is true if the
+    /// subgraph is paused.
+    /// Returns None if the deployment does not exist.
+    fn assignment_status(
+        &self,
+        deployment: &DeploymentLocator,
+    ) -> Result<Option<(NodeId, bool)>, StoreError>;
+
     fn assignments(&self, node: &NodeId) -> Result<Vec<DeploymentLocator>, StoreError>;
+
+    /// Returns assignments that are not paused
+    fn active_assignments(&self, node: &NodeId) -> Result<Vec<DeploymentLocator>, StoreError>;
 
     /// Return `true` if a subgraph `name` exists, regardless of whether the
     /// subgraph has any deployments attached to it
@@ -111,7 +125,7 @@ pub trait SubgraphStore: Send + Sync + 'static {
     ) -> Result<Vec<EntityOperation>, StoreError>;
 
     /// Return the GraphQL schema supplied by the user
-    fn input_schema(&self, subgraph_id: &DeploymentHash) -> Result<Arc<Schema>, StoreError>;
+    fn input_schema(&self, subgraph_id: &DeploymentHash) -> Result<Arc<InputSchema>, StoreError>;
 
     /// Return the GraphQL schema that was derived from the user's schema by
     /// adding a root query type etc. to it
@@ -138,10 +152,14 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// assumptions about the in-memory state of writing has been made; in
     /// particular, no assumptions about whether previous writes have
     /// actually been committed or not.
+    ///
+    /// The `manifest_idx_and_name` lists the correspondence between data
+    /// source or template position in the manifest and name.
     async fn writable(
         self: Arc<Self>,
         logger: Logger,
         deployment: DeploymentId,
+        manifest_idx_and_name: Arc<Vec<(u32, String)>>,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
     /// Initiate a graceful shutdown of the writable that a previous call to
@@ -156,8 +174,12 @@ pub trait SubgraphStore: Send + Sync + 'static {
 
     async fn is_healthy(&self, id: &DeploymentHash) -> Result<bool, StoreError>;
 
-    /// Find the deployment locators for the subgraph with the given hash
+    /// Find all deployment locators for the subgraph with the given hash.
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError>;
+
+    /// Find the deployment locator for the active deployment with the given
+    /// hash. Returns `None` if there is no deployment with that hash
+    fn active_locator(&self, hash: &str) -> Result<Option<DeploymentLocator>, StoreError>;
 
     /// This migrates subgraphs that existed before the raw_yaml column was added.
     async fn set_manifest_raw_yaml(
@@ -165,20 +187,30 @@ pub trait SubgraphStore: Send + Sync + 'static {
         hash: &DeploymentHash,
         raw_yaml: String,
     ) -> Result<(), StoreError>;
+
+    /// Return `true` if the `instrument` flag for the deployment is set.
+    /// When this flag is set, indexing of the deployment should log
+    /// additional diagnostic information
+    fn instrument(&self, deployment: &DeploymentLocator) -> Result<bool, StoreError>;
 }
 
 pub trait ReadStore: Send + Sync + 'static {
     /// Looks up an entity using the given store key at the latest block.
     fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
 
-    /// Look up multiple entities as of the latest block. Returns a map of
-    /// entities by type.
+    /// Look up multiple entities as of the latest block.
     fn get_many(
         &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
+        keys: BTreeSet<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError>;
 
-    fn input_schema(&self) -> Arc<Schema>;
+    /// Reverse lookup
+    fn get_derived(
+        &self,
+        query_derived: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError>;
+
+    fn input_schema(&self) -> Arc<InputSchema>;
 }
 
 // This silly impl is needed until https://github.com/rust-lang/rust/issues/65991 is stable.
@@ -189,13 +221,40 @@ impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
 
     fn get_many(
         &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
-        (**self).get_many(ids_for_type)
+        keys: BTreeSet<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        (**self).get_many(keys)
     }
 
-    fn input_schema(&self) -> Arc<Schema> {
+    fn get_derived(
+        &self,
+        entity_derived: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        (**self).get_derived(entity_derived)
+    }
+
+    fn input_schema(&self) -> Arc<InputSchema> {
         (**self).input_schema()
+    }
+}
+
+pub trait DeploymentCursorTracker: Sync + Send + 'static {
+    /// Get a pointer to the most recently processed block in the subgraph.
+    fn block_ptr(&self) -> Option<BlockPtr>;
+
+    /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
+    /// is used when re-connecting a Firehose stream to start back exactly where we left off.
+    fn firehose_cursor(&self) -> FirehoseCursor;
+}
+
+// This silly impl is needed until https://github.com/rust-lang/rust/issues/65991 is stable.
+impl<T: ?Sized + DeploymentCursorTracker> DeploymentCursorTracker for Arc<T> {
+    fn block_ptr(&self) -> Option<BlockPtr> {
+        (**self).block_ptr()
+    }
+
+    fn firehose_cursor(&self) -> FirehoseCursor {
+        (**self).firehose_cursor()
     }
 }
 
@@ -204,14 +263,7 @@ impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
 /// `StoreError::DatabaseUnavailable`. Instead, they will retry the
 /// operation indefinitely until it succeeds.
 #[async_trait]
-pub trait WritableStore: ReadStore {
-    /// Get a pointer to the most recently processed block in the subgraph.
-    fn block_ptr(&self) -> Option<BlockPtr>;
-
-    /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
-    /// is used when re-connecting a Firehose stream to start back exactly where we left off.
-    fn block_cursor(&self) -> FirehoseCursor;
-
+pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     /// Start an existing subgraph deployment.
     async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError>;
 
@@ -257,8 +309,8 @@ pub trait WritableStore: ReadStore {
         stopwatch: &StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
-        manifest_idx_and_name: Vec<(u32, String)>,
         offchain_to_remove: Vec<StoredDynamicDataSource>,
+        is_non_fatal_errors_active: bool,
     ) -> Result<(), StoreError>;
 
     /// The deployment `id` finished syncing, mark it as synced in the database
@@ -289,6 +341,18 @@ pub trait WritableStore: ReadStore {
 
     /// Wait for the background writer to finish processing its queue
     async fn flush(&self) -> Result<(), StoreError>;
+
+    /// Restart the `WritableStore`. This will clear any errors that have
+    /// been encountered. Code that calls this must not make any assumptions
+    /// about what has been written already, as the write queue might
+    /// contain unprocessed write requests that will be discarded by this
+    /// call.
+    ///
+    /// This call returns `None` if a restart was not needed because `self`
+    /// had no errors. If it returns `Some`, `self` should not be used
+    /// anymore, as it will continue to produce errors for any write
+    /// requests, and instead, the returned `WritableStore` should be used.
+    async fn restart(self: Arc<Self>) -> Result<Option<Arc<dyn WritableStore>>, StoreError>;
 }
 
 #[async_trait]
@@ -419,7 +483,7 @@ pub trait ChainStore: Send + Sync + 'static {
     ) -> Result<Vec<transaction_receipt::LightTransactionReceipt>, StoreError>;
 
     /// Clears call cache of the chain for the given `from` and `to` block number.
-    async fn clear_call_cache(&self, from: Option<i32>, to: Option<i32>) -> Result<(), Error>;
+    async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error>;
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {
@@ -452,7 +516,7 @@ pub trait QueryStore: Send + Sync {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<(Vec<BTreeMap<Word, r::Value>>, Trace), QueryExecutionError>;
+    ) -> Result<(Vec<Object>, Trace), QueryExecutionError>;
 
     async fn is_deployment_synced(&self) -> Result<bool, Error>;
 

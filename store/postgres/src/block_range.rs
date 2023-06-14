@@ -15,6 +15,9 @@ use crate::relational::{SqlName, Table};
 /// entities
 pub(crate) const BLOCK_RANGE_COLUMN: &str = "block_range";
 
+/// The name of the column that stores the causality region of an entity.
+pub(crate) const CAUSALITY_REGION_COLUMN: &str = "causality_region";
+
 /// The SQL clause we use to check that an entity version is current;
 /// that version has an unbounded block range, but checking for
 /// `upper_inf(block_range)` is slow and can't use the exclusion
@@ -50,16 +53,6 @@ lazy_static! {
 #[derive(Clone, Debug)]
 pub struct BlockRange(Bound<BlockNumber>, Bound<BlockNumber>);
 
-// Doing this properly by implementing Clone for Bound is currently
-// a nightly-only feature, so we need to work around that
-fn clone_bound(bound: Bound<&BlockNumber>) -> Bound<BlockNumber> {
-    match bound {
-        Bound::Included(nr) => Bound::Included(*nr),
-        Bound::Excluded(nr) => Bound::Excluded(*nr),
-        Bound::Unbounded => Bound::Unbounded,
-    }
-}
-
 pub(crate) fn first_block_in_range(
     bound: &(Bound<BlockNumber>, Bound<BlockNumber>),
 ) -> Option<BlockNumber> {
@@ -84,10 +77,13 @@ pub(crate) fn block_number(block_ptr: &BlockPtr) -> BlockNumber {
 
 impl From<RangeFrom<BlockNumber>> for BlockRange {
     fn from(range: RangeFrom<BlockNumber>) -> BlockRange {
-        BlockRange(
-            clone_bound(range.start_bound()),
-            clone_bound(range.end_bound()),
-        )
+        BlockRange(range.start_bound().cloned(), range.end_bound().cloned())
+    }
+}
+
+impl From<std::ops::Range<BlockNumber>> for BlockRange {
+    fn from(range: std::ops::Range<BlockNumber>) -> BlockRange {
+        BlockRange(Bound::Included(range.start), Bound::Excluded(range.end))
     }
 }
 
@@ -229,18 +225,6 @@ impl<'a> BlockRangeColumn<'a> {
                 out.push_sql(table_prefix);
                 out.push_sql(BLOCK_COLUMN);
             }
-        }
-    }
-
-    /// Output the literal value of the block range `[block,..)`, mostly for
-    /// generating an insert statement containing the block range column
-    pub fn literal_range_current(&self, out: &mut AstPass<Pg>) -> QueryResult<()> {
-        match self {
-            BlockRangeColumn::Mutable { block, .. } => {
-                let block_range: BlockRange = (*block..).into();
-                out.push_bind_param::<Range<Integer>, _>(&block_range)
-            }
-            BlockRangeColumn::Immutable { block, .. } => out.push_bind_param::<Integer, _>(block),
         }
     }
 

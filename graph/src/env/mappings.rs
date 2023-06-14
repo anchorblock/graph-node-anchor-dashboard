@@ -36,7 +36,7 @@ pub struct EnvVarsMapping {
     /// The timeout for all IPFS requests.
     ///
     /// Set by the environment variable `GRAPH_IPFS_TIMEOUT` (expressed in
-    /// seconds). The default value is 30s.
+    /// seconds). The default value is 60s.
     pub ipfs_timeout: Duration,
     /// Sets the `ipfs.map` file size limit.
     ///
@@ -46,10 +46,10 @@ pub struct EnvVarsMapping {
     /// Sets the `ipfs.cat` file size limit.
     ///
     /// Set by the environment variable `GRAPH_MAX_IPFS_FILE_BYTES` (expressed in
-    /// bytes). Defaults to 256 MiB.
+    /// bytes). Defaults to 25 MiB.
     pub max_ipfs_file_bytes: usize,
 
-    /// Limits both concurrent and per second requests to IPFS for file data sources.
+    /// Limits per second requests to IPFS for file data sources.
     ///
     /// Set by the environment variable `GRAPH_IPFS_REQUEST_LIMIT`. Defaults to 100.
     pub ipfs_request_limit: u16,
@@ -105,12 +105,12 @@ pub struct InnerMappingHandlers {
     max_ipfs_cache_file_size: WithDefaultUsize<usize, { 1024 * 1024 }>,
     #[envconfig(from = "GRAPH_MAX_IPFS_CACHE_SIZE", default = "50")]
     max_ipfs_cache_size: u64,
-    #[envconfig(from = "GRAPH_IPFS_TIMEOUT", default = "30")]
+    #[envconfig(from = "GRAPH_IPFS_TIMEOUT", default = "60")]
     ipfs_timeout_in_secs: u64,
     #[envconfig(from = "GRAPH_MAX_IPFS_MAP_FILE_SIZE", default = "")]
     max_ipfs_map_file_size: WithDefaultUsize<usize, { 256 * 1024 * 1024 }>,
     #[envconfig(from = "GRAPH_MAX_IPFS_FILE_BYTES", default = "")]
-    max_ipfs_file_bytes: WithDefaultUsize<usize, { 256 * 1024 * 1024 }>,
+    max_ipfs_file_bytes: WithDefaultUsize<usize, { 25 * 1024 * 1024 }>,
     #[envconfig(from = "GRAPH_IPFS_REQUEST_LIMIT", default = "100")]
     ipfs_request_limit: u16,
     #[envconfig(from = "GRAPH_ALLOW_NON_DETERMINISTIC_IPFS", default = "false")]

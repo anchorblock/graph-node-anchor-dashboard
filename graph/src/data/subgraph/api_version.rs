@@ -59,11 +59,15 @@ impl UnifiedMappingApiVersion {
 
         let unified_version: Option<Version> = match (all_below_referential_version, all_the_same) {
             (false, false) => return Err(DifferentMappingApiVersions(unique_versions)),
-            (false, true) => Some(unique_versions.iter().nth(0).unwrap().clone()),
+            (false, true) => Some(unique_versions.iter().next().unwrap().clone()),
             (true, _) => None,
         };
 
         Ok(UnifiedMappingApiVersion(unified_version))
+    }
+
+    pub fn version(&self) -> Option<&Version> {
+        self.0.as_ref()
     }
 }
 

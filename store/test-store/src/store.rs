@@ -1,10 +1,15 @@
 use diesel::{self, PgConnection};
+use graph::blockchain::mock::MockDataSource;
 use graph::data::graphql::effort::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
+use graph::data::subgraph::SubgraphFeature;
+use graph::data_source::CausalityRegion;
+use graph::data_source::DataSource;
 use graph::log;
 use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
+use graph::schema::InputSchema;
 use graph::semver::Version;
 use graph::{
     blockchain::block_stream::FirehoseCursor, blockchain::ChainIdentifier,
@@ -16,7 +21,6 @@ use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
 };
 use graph_graphql::test_support::GraphQLMetrics;
-use graph_mock::MockMetricsRegistry;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
 use graph_store_postgres::layout_for_tests::FAKE_NETWORK_SHARED;
@@ -49,10 +53,9 @@ lazy_static! {
     static ref SEQ_LOCK: Mutex<()> = Mutex::new(());
     pub static ref STORE_RUNTIME: Runtime =
         Builder::new_multi_thread().enable_all().build().unwrap();
-    pub static ref METRICS_REGISTRY: Arc<MockMetricsRegistry> =
-        Arc::new(MockMetricsRegistry::new());
+    pub static ref METRICS_REGISTRY: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     pub static ref LOAD_MANAGER: Arc<LoadManager> = Arc::new(LoadManager::new(
-        &*LOGGER,
+        &LOGGER,
         Vec::new(),
         METRICS_REGISTRY.clone(),
     ));
@@ -152,7 +155,7 @@ pub async fn create_subgraph(
     schema: &str,
     base: Option<(DeploymentHash, BlockPtr)>,
 ) -> Result<DeploymentLocator, StoreError> {
-    let schema = Schema::parse(schema, subgraph_id.clone()).unwrap();
+    let schema = InputSchema::parse(schema, subgraph_id.clone()).unwrap();
 
     let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
         id: subgraph_id.clone(),
@@ -167,19 +170,25 @@ pub async fn create_subgraph(
         chain: PhantomData,
     };
 
+    create_subgraph_with_manifest(subgraph_id, schema, manifest, base).await
+}
+
+pub async fn create_subgraph_with_manifest(
+    subgraph_id: &DeploymentHash,
+    schema: InputSchema,
+    manifest: SubgraphManifest<graph::blockchain::mock::MockBlockchain>,
+    base: Option<(DeploymentHash, BlockPtr)>,
+) -> Result<DeploymentLocator, StoreError> {
     let mut yaml = serde_yaml::Mapping::new();
     yaml.insert("dataSources".into(), Vec::<serde_yaml::Value>::new().into());
     let yaml = serde_yaml::to_string(&yaml).unwrap();
     let deployment = DeploymentCreate::new(yaml, &manifest, None).graft(base);
-    let name = {
-        let mut name = subgraph_id.to_string();
-        name.truncate(32);
-        SubgraphName::new(name).unwrap()
-    };
+    let name = SubgraphName::new_unchecked(subgraph_id.to_string());
     let deployment = SUBGRAPH_STORE.create_deployment_replace(
         name,
         &schema,
         deployment,
+        manifest.deployment_features(),
         NODE_ID.clone(),
         NETWORK_NAME.to_string(),
         SubgraphVersionSwitchingMode::Instant,
@@ -187,9 +196,9 @@ pub async fn create_subgraph(
 
     SUBGRAPH_STORE
         .cheap_clone()
-        .writable(LOGGER.clone(), deployment.id)
+        .writable(LOGGER.clone(), deployment.id, Arc::new(Vec::new()))
         .await?
-        .start_subgraph_deployment(&*LOGGER)
+        .start_subgraph_deployment(&LOGGER)
         .await?;
     Ok(deployment)
 }
@@ -198,26 +207,64 @@ pub async fn create_test_subgraph(subgraph_id: &DeploymentHash, schema: &str) ->
     create_subgraph(subgraph_id, schema, None).await.unwrap()
 }
 
-pub fn remove_subgraph(id: &DeploymentHash) {
-    let name = {
-        let mut name = id.to_string();
-        name.truncate(32);
-        SubgraphName::new(name).unwrap()
+pub async fn create_test_subgraph_with_features(
+    subgraph_id: &DeploymentHash,
+    schema: &str,
+) -> DeploymentLocator {
+    let schema = InputSchema::parse(schema, subgraph_id.clone()).unwrap();
+
+    let features = [
+        SubgraphFeature::FullTextSearch,
+        SubgraphFeature::NonFatalErrors,
+    ]
+    .iter()
+    .cloned()
+    .collect::<BTreeSet<_>>();
+
+    let manifest = SubgraphManifest::<graph::blockchain::mock::MockBlockchain> {
+        id: subgraph_id.clone(),
+        spec_version: Version::new(1, 0, 0),
+        features: features,
+        description: Some(format!("manifest for {}", subgraph_id)),
+        repository: Some(format!("repo for {}", subgraph_id)),
+        schema: schema.clone(),
+        data_sources: vec![DataSource::Onchain(MockDataSource {
+            kind: "mock/kind".into(),
+            api_version: Version::new(1, 0, 0),
+        })],
+        graft: None,
+        templates: vec![],
+        chain: PhantomData,
     };
+
+    create_subgraph_with_manifest(subgraph_id, schema, manifest, None)
+        .await
+        .unwrap()
+}
+
+pub fn remove_subgraph(id: &DeploymentHash) {
+    let name = SubgraphName::new_unchecked(id.to_string());
     SUBGRAPH_STORE.remove_subgraph(name).unwrap();
-    for detail in SUBGRAPH_STORE.record_unused_deployments().unwrap() {
-        SUBGRAPH_STORE.remove_deployment(detail.id).unwrap();
+    let locs = SUBGRAPH_STORE.locators(id.as_str()).unwrap();
+    let conn = primary_connection();
+    for loc in locs {
+        let site = conn.locate_site(loc.clone()).unwrap().unwrap();
+        conn.unassign_subgraph(&site).unwrap();
+        SUBGRAPH_STORE.remove_deployment(site.id).unwrap();
     }
 }
 
 /// Transact errors for this block and wait until changes have been written
+/// Takes store, deployment, block ptr to, errors, and a bool indicating whether
+/// nonFatalErrors are active
 pub async fn transact_errors(
     store: &Arc<Store>,
     deployment: &DeploymentLocator,
     block_ptr_to: BlockPtr,
     errs: Vec<SubgraphError>,
+    is_non_fatal_errors_active: bool,
 ) -> Result<(), StoreError> {
-    let metrics_registry = Arc::new(MockMetricsRegistry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::mock());
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment.hash.clone(),
@@ -226,7 +273,7 @@ pub async fn transact_errors(
     );
     store
         .subgraph_store()
-        .writable(LOGGER.clone(), deployment.id)
+        .writable(LOGGER.clone(), deployment.id, Arc::new(Vec::new()))
         .await?
         .transact_block_operations(
             block_ptr_to,
@@ -236,7 +283,7 @@ pub async fn transact_errors(
             Vec::new(),
             errs,
             Vec::new(),
-            Vec::new(),
+            is_non_fatal_errors_active,
         )
         .await?;
     flush(deployment).await
@@ -287,15 +334,19 @@ pub async fn transact_entities_and_dynamic_data_sources(
     ops: Vec<EntityOperation>,
     manifest_idx_and_name: Vec<(u32, String)>,
 ) -> Result<(), StoreError> {
-    let store =
-        futures03::executor::block_on(store.cheap_clone().writable(LOGGER.clone(), deployment.id))?;
+    let store = futures03::executor::block_on(store.cheap_clone().writable(
+        LOGGER.clone(),
+        deployment.id,
+        Arc::new(manifest_idx_and_name),
+    ))?;
+
     let mut entity_cache = EntityCache::new(Arc::new(store.clone()));
     entity_cache.append(ops);
     let mods = entity_cache
-        .as_modifications()
+        .as_modifications(block_ptr_to.number)
         .expect("failed to convert to modifications")
         .modifications;
-    let metrics_registry = Arc::new(MockMetricsRegistry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::mock());
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment.hash.clone(),
@@ -310,8 +361,8 @@ pub async fn transact_entities_and_dynamic_data_sources(
             &stopwatch_metrics,
             data_sources,
             Vec::new(),
-            manifest_idx_and_name,
             Vec::new(),
+            false,
         )
         .await
 }
@@ -320,7 +371,7 @@ pub async fn transact_entities_and_dynamic_data_sources(
 pub async fn revert_block(store: &Arc<Store>, deployment: &DeploymentLocator, ptr: &BlockPtr) {
     store
         .subgraph_store()
-        .writable(LOGGER.clone(), deployment.id)
+        .writable(LOGGER.clone(), deployment.id, Arc::new(Vec::new()))
         .await
         .expect("can get writable")
         .revert_block_operations(ptr.clone(), FirehoseCursor::None)
@@ -355,12 +406,13 @@ pub async fn insert_entities(
             key: EntityKey {
                 entity_type,
                 entity_id: data.get("id").unwrap().clone().as_string().unwrap().into(),
+                causality_region: CausalityRegion::ONCHAIN,
             },
             data,
         });
 
     transact_entity_operations(
-        &*SUBGRAPH_STORE,
+        &SUBGRAPH_STORE,
         deployment,
         GENESIS_PTR.clone(),
         insert_ops.collect::<Vec<_>>(),
@@ -374,7 +426,7 @@ pub async fn insert_entities(
 pub async fn flush(deployment: &DeploymentLocator) -> Result<(), StoreError> {
     let writable = SUBGRAPH_STORE
         .cheap_clone()
-        .writable(LOGGER.clone(), deployment.id)
+        .writable(LOGGER.clone(), deployment.id, Arc::new(Vec::new()))
         .await
         .expect("we can get a writable");
     writable.flush().await
@@ -502,7 +554,7 @@ async fn execute_subgraph_query_internal(
 pub async fn deployment_state(store: &Store, subgraph_id: &DeploymentHash) -> DeploymentState {
     store
         .query_store(
-            QueryTarget::Deployment(subgraph_id.to_owned(), Default::default()),
+            QueryTarget::Deployment(subgraph_id.clone(), Default::default()),
             false,
         )
         .await
@@ -543,12 +595,12 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
     }
     opt.store_connection_pool_size = CONN_POOL_SIZE;
 
-    let config = Config::load(&*LOGGER, &opt)
+    let config = Config::load(&LOGGER, &opt)
         .unwrap_or_else(|_| panic!("config is not valid (file={:?})", &opt.config));
-    let registry = Arc::new(MockMetricsRegistry::new());
+    let registry = Arc::new(MetricsRegistry::mock());
     std::thread::spawn(move || {
         STORE_RUNTIME.handle().block_on(async {
-            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, None, registry).await;
+            let builder = StoreBuilder::new(&LOGGER, &NODE_ID, &config, None, registry).await;
             let subscription_manager = builder.subscription_manager();
             let primary_pool = builder.primary_pool();
 
@@ -558,10 +610,14 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
             };
 
             (
-                builder.network_store(vec![
-                    (NETWORK_NAME.to_string(), vec![ident.clone()]),
-                    (FAKE_NETWORK_SHARED.to_string(), vec![ident]),
-                ]),
+                builder.network_store(
+                    vec![
+                        (NETWORK_NAME.to_string(), ident.clone()),
+                        (FAKE_NETWORK_SHARED.to_string(), ident),
+                    ]
+                    .into_iter()
+                    .collect(),
+                ),
                 primary_pool,
                 config,
                 subscription_manager,

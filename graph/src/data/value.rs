@@ -1,4 +1,5 @@
 use crate::prelude::{q, s, CacheWeight};
+use crate::runtime::gas::{Gas, GasSizeOf, SaturatingInto};
 use serde::ser::{SerializeMap, SerializeSeq, Serializer};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -13,7 +14,7 @@ pub struct Word(Box<str>);
 
 impl Word {
     pub fn as_str(&self) -> &str {
-        &*self.0
+        &self.0
     }
 }
 
@@ -27,7 +28,7 @@ impl std::ops::Deref for Word {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
@@ -40,6 +41,12 @@ impl From<&str> for Word {
 impl From<String> for Word {
     fn from(s: String) -> Self {
         Word(s.into_boxed_str())
+    }
+}
+
+impl From<Word> for String {
+    fn from(w: Word) -> Self {
+        w.0.into()
     }
 }
 
@@ -58,6 +65,47 @@ impl<'de> serde::Deserialize<'de> for Word {
         D: serde::Deserializer<'de>,
     {
         String::deserialize(deserializer).map(Into::into)
+    }
+}
+
+impl stable_hash_legacy::StableHash for Word {
+    #[inline]
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        self.as_str().stable_hash(sequence_number, state)
+    }
+}
+
+impl stable_hash::StableHash for Word {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        self.as_str().stable_hash(field_address, state)
+    }
+}
+
+impl GasSizeOf for Word {
+    fn gas_size_of(&self) -> Gas {
+        self.0.len().saturating_into()
+    }
+}
+
+impl AsRef<str> for Word {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl PartialEq<&str> for Word {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl PartialEq<Word> for &str {
+    fn eq(&self, other: &Word) -> bool {
+        self == &other.as_str()
     }
 }
 
@@ -87,6 +135,10 @@ impl Entry {
 pub struct Object(Box<[Entry]>);
 
 impl Object {
+    pub fn empty() -> Object {
+        Object(Box::new([]))
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.0
             .iter()
@@ -112,18 +164,35 @@ impl Object {
         self.0.len()
     }
 
-    pub fn extend(&mut self, other: Object) {
+    /// Add the entries from an object to `self`. Note that if `self` and
+    /// `object` have entries with identical keys, the entry in `self` wins.
+    pub fn append(&mut self, other: Object) {
         let mut entries = std::mem::replace(&mut self.0, Box::new([])).into_vec();
         entries.extend(other.0.into_vec());
         self.0 = entries.into_boxed_slice();
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
-impl FromIterator<(String, Value)> for Object {
-    fn from_iter<T: IntoIterator<Item = (String, Value)>>(iter: T) -> Self {
+impl Extend<(Word, Value)> for Object {
+    /// Add the entries from the iterator to an object. Note that if the
+    /// iterator produces a key that is already set in the object, it will
+    /// not be overwritten, and the previous value wins.
+    fn extend<T: IntoIterator<Item = (Word, Value)>>(&mut self, iter: T) {
+        let mut entries = std::mem::replace(&mut self.0, Box::new([])).into_vec();
+        entries.extend(iter.into_iter().map(|(key, value)| Entry::new(key, value)));
+        self.0 = entries.into_boxed_slice();
+    }
+}
+
+impl FromIterator<(Word, Value)> for Object {
+    fn from_iter<T: IntoIterator<Item = (Word, Value)>>(iter: T) -> Self {
         let mut items: Vec<_> = Vec::new();
         for (key, value) in iter {
-            items.push(Entry::new(key.into(), value))
+            items.push(Entry::new(key, value))
         }
         Object(items.into_boxed_slice())
     }
@@ -261,6 +330,8 @@ impl Value {
                     Err(Value::Int(num))
                 }
             }
+            ("Int8", Value::Int(num)) => Ok(Value::String(num.to_string())),
+            ("Int8", Value::String(num)) => Ok(Value::String(num)),
             ("String", Value::String(s)) => Ok(Value::String(s)),
             ("ID", Value::String(s)) => Ok(Value::String(s)),
             ("ID", Value::Int(n)) => Ok(Value::String(n.to_string())),
@@ -401,8 +472,10 @@ impl From<serde_json::Value> for Value {
                 Value::List(vals)
             }
             serde_json::Value::Object(map) => {
-                let obj =
-                    Object::from_iter(map.into_iter().map(|(key, val)| (key, Value::from(val))));
+                let obj = Object::from_iter(
+                    map.into_iter()
+                        .map(|(key, val)| (Word::from(key), Value::from(val))),
+                );
                 Value::Object(obj)
             }
         }

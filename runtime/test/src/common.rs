@@ -109,12 +109,19 @@ pub fn mock_context(
             api_version,
         )),
         state: BlockState::new(
-            futures03::executor::block_on(store.writable(LOGGER.clone(), deployment.id)).unwrap(),
+            futures03::executor::block_on(store.writable(
+                LOGGER.clone(),
+                deployment.id,
+                Arc::new(Vec::new()),
+            ))
+            .unwrap(),
             Default::default(),
         ),
         proof_of_indexing: None,
         host_fns: Arc::new(Vec::new()),
         debug_fork: None,
+        mapping_logger: Logger::root(slog::Discard, o!()),
+        instrument: false,
     }
 }
 

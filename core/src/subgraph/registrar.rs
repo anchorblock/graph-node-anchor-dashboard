@@ -6,6 +6,7 @@ use graph::blockchain::Blockchain;
 use graph::blockchain::BlockchainKind;
 use graph::blockchain::BlockchainMap;
 use graph::components::store::{DeploymentId, DeploymentLocator, SubscriptionManager};
+use graph::components::subgraph::Settings;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph::data::subgraph::Graft;
 use graph::prelude::{
@@ -24,6 +25,7 @@ pub struct SubgraphRegistrar<P, S, SM> {
     node_id: NodeId,
     version_switching_mode: SubgraphVersionSwitchingMode,
     assignment_event_stream_cancel_guard: CancelGuard, // cancels on drop
+    settings: Arc<Settings>,
 }
 
 impl<P, S, SM> SubgraphRegistrar<P, S, SM>
@@ -41,6 +43,7 @@ where
         chains: Arc<BlockchainMap>,
         node_id: NodeId,
         version_switching_mode: SubgraphVersionSwitchingMode,
+        settings: Arc<Settings>,
     ) -> Self {
         let logger = logger_factory.component_logger("SubgraphRegistrar", None);
         let logger_factory = logger_factory.with_parent(logger.clone());
@@ -58,6 +61,7 @@ where
             node_id,
             version_switching_mode,
             assignment_event_stream_cancel_guard: CancelGuard::new(),
+            settings,
         }
     }
 
@@ -88,8 +92,7 @@ where
         // - The event stream sees a Remove event for subgraph B, but the table query finds that
         //   subgraph B has already been removed.
         // The `handle_assignment_events` function handles these cases by ignoring AlreadyRunning
-        // (on subgraph start) or NotRunning (on subgraph stop) error types, which makes the
-        // operations idempotent.
+        // (on subgraph start) which makes the operations idempotent. Subgraph stop is already idempotent.
 
         // Start event stream
         let assignment_event_stream = self.assignment_events();
@@ -168,13 +171,20 @@ where
                     match operation {
                         EntityChangeOperation::Set => {
                             store
-                                .assigned_node(&deployment)
+                                .assignment_status(&deployment)
                                 .map_err(|e| {
                                     anyhow!("Failed to get subgraph assignment entity: {}", e)
                                 })
                                 .map(|assigned| -> Box<dyn Stream<Item = _, Error = _> + Send> {
-                                    if let Some(assigned) = assigned {
+                                    if let Some((assigned,is_paused)) = assigned {
                                         if assigned == node_id {
+
+                                            if is_paused{
+                                                // Subgraph is paused, so we don't start it
+                                                debug!(logger, "Deployment assignee is this node, but it is paused, so we don't start it"; "assigned_to" => assigned, "node_id" => &node_id,"paused" => is_paused);
+                                                return Box::new(stream::empty());
+                                            }
+
                                             // Start subgraph on this node
                                             debug!(logger, "Deployment assignee is this node, broadcasting add event"; "assigned_to" => assigned, "node_id" => &node_id);
                                             Box::new(stream::once(Ok(AssignmentEvent::Add {
@@ -216,7 +226,7 @@ where
         let logger = self.logger.clone();
         let node_id = self.node_id.clone();
 
-        future::result(self.store.assignments(&self.node_id))
+        future::result(self.store.active_assignments(&self.node_id))
             .map_err(|e| anyhow!("Error querying subgraph assignments: {}", e))
             .and_then(move |deployments| {
                 // This operation should finish only after all subgraphs are
@@ -270,6 +280,7 @@ where
         debug_fork: Option<DeploymentHash>,
         start_block_override: Option<BlockPtr>,
         graft_block_override: Option<BlockPtr>,
+        history_blocks: Option<i32>,
     ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
         // We don't have a location for the subgraph yet; that will be
         // assigned when we deploy for real. For logging purposes, make up a
@@ -297,6 +308,10 @@ where
             SubgraphRegistrarError::ResolveError(SubgraphManifestResolveError::ResolveError(e))
         })?;
 
+        // Give priority to deployment specific history_blocks value.
+        let history_blocks =
+            history_blocks.or(self.settings.for_name(&name).map(|c| c.history_blocks));
+
         let deployment_locator = match kind {
             BlockchainKind::Arweave => {
                 create_subgraph_version::<graph_chain_arweave::Chain, _>(
@@ -312,6 +327,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -329,6 +345,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -346,6 +363,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -363,6 +381,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -380,6 +399,7 @@ where
                     debug_fork,
                     self.version_switching_mode,
                     &self.resolver,
+                    history_blocks,
                 )
                 .await?
             }
@@ -412,21 +432,10 @@ where
         hash: &DeploymentHash,
         node_id: &NodeId,
     ) -> Result<(), SubgraphRegistrarError> {
-        let locations = self.store.locators(hash)?;
-        let deployment = match locations.len() {
-            0 => return Err(SubgraphRegistrarError::DeploymentNotFound(hash.to_string())),
-            1 => locations[0].clone(),
-            _ => {
-                return Err(SubgraphRegistrarError::StoreError(
-                    anyhow!(
-                        "there are {} different deployments with id {}",
-                        locations.len(),
-                        hash.as_str()
-                    )
-                    .into(),
-                ))
-            }
-        };
+        let locator = self.store.active_locator(hash)?;
+        let deployment =
+            locator.ok_or_else(|| SubgraphRegistrarError::DeploymentNotFound(hash.to_string()))?;
+
         self.store.reassign_subgraph(&deployment, node_id)?;
 
         Ok(())
@@ -438,7 +447,7 @@ async fn handle_assignment_event(
     provider: Arc<impl SubgraphAssignmentProviderTrait>,
     logger: Logger,
 ) -> Result<(), CancelableError<SubgraphAssignmentProviderError>> {
-    let logger = logger.to_owned();
+    let logger = logger.clone();
 
     debug!(logger, "Received assignment event: {:?}", event);
 
@@ -455,7 +464,6 @@ async fn handle_assignment_event(
             node_id: _,
         } => match provider.stop(deployment).await {
             Ok(()) => Ok(()),
-            Err(SubgraphAssignmentProviderError::NotRunning(_)) => Ok(()),
             Err(e) => Err(CancelableError::Error(e)),
         },
     }
@@ -554,6 +562,7 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
     debug_fork: Option<DeploymentHash>,
     version_switching_mode: SubgraphVersionSwitchingMode,
     resolver: &Arc<dyn LinkResolver>,
+    history_blocks: Option<i32>,
 ) -> Result<DeploymentLocator, SubgraphRegistrarError> {
     let raw_string = serde_yaml::to_string(&raw).unwrap();
     let unvalidated = UnvalidatedSubgraphManifest::<C>::resolve(
@@ -620,16 +629,39 @@ async fn create_subgraph_version<C: Blockchain, S: SubgraphStore>(
         "block" => format!("{:?}", base_block.as_ref().map(|(_,ptr)| ptr.number))
     );
 
+    // Entity types that may be touched by offchain data sources need a causality region column.
+    let needs_causality_region = manifest
+        .data_sources
+        .iter()
+        .filter_map(|ds| ds.as_offchain())
+        .map(|ds| ds.mapping.entities.iter())
+        .chain(
+            manifest
+                .templates
+                .iter()
+                .filter_map(|ds| ds.as_offchain())
+                .map(|ds| ds.mapping.entities.iter()),
+        )
+        .flatten()
+        .cloned()
+        .collect();
+
     // Apply the subgraph versioning and deployment operations,
     // creating a new subgraph deployment if one doesn't exist.
-    let deployment = DeploymentCreate::new(raw_string, &manifest, start_block)
+    let mut deployment = DeploymentCreate::new(raw_string, &manifest, start_block)
         .graft(base_block)
-        .debug(debug_fork);
+        .debug(debug_fork)
+        .entities_with_causality_region(needs_causality_region);
+    if let Some(history_blocks) = history_blocks {
+        deployment = deployment.with_history_blocks(history_blocks);
+    }
+
     deployment_store
         .create_subgraph_deployment(
             name,
             &manifest.schema,
             deployment,
+            manifest.deployment_features(),
             node_id,
             network_name,
             version_switching_mode,
